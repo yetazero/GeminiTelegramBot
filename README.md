@@ -30,7 +30,7 @@ Follow these steps to set up and run your Gemini Telegram Bot.
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git](https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git)
+    git clone [https://github.com/yetazero/GeminiTelegramBot](https://github.com/yetazero/GeminiTelegramBot)
     cd YOUR_REPO_NAME
     ```
 2.  **Create a virtual environment (recommended):**
