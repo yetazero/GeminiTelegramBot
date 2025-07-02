@@ -15,6 +15,7 @@ import html
 from dotenv import load_dotenv
 from telegram.constants import ParseMode, ChatAction
 import httpx
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -28,8 +29,8 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 INITIAL_HTML_INSTRUCTION = []
 
-text_model = genai.GenerativeModel('gemini-2.5-flash')
-vision_audio_model = genai.GenerativeModel('gemini-2.5-flash')
+text_model = genai.GenerativeModel('gemini-1.5-flash')
+vision_audio_model = genai.GenerativeModel('gemini-1.5-flash')
 
 safety_settings = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -39,68 +40,69 @@ safety_settings = {
 }
 
 user_chat_sessions = {}
+user_last_active = {}
+SESSION_EXPIRATION_TIME = timedelta(hours=1)
 
 RATE_LIMIT_SECONDS = 10
 RATE_LIMIT_MESSAGES = 1
 COOLDOWN_SECONDS = 30
-
 REPEAT_MESSAGE_THRESHOLD = 2
-REPEAT_MESSAGE_COOLDOWN = 10
-
 user_activity = {}
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def clean_text_formatting(text: str) -> str:
+def clean_text_for_telegram(text: str) -> str:
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'```[\s\S]*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`(.*?)`', r'\1', text)
+    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*[\*\-]\s', '', text, flags=re.MULTILINE)
     text = re.sub(r'<[^>]+>', '', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = text.strip()
     return text
 
-def sanitize_html_tags(text: str) -> str:
-    return html.escape(text)
+async def cleanup_old_sessions():
+    now = datetime.now()
+    expired_users = [
+        user_id for user_id, last_active_time in user_last_active.items()
+        if now - last_active_time > SESSION_EXPIRATION_TIME
+    ]
+    for user_id in expired_users:
+        if user_id in user_chat_sessions:
+            del user_chat_sessions[user_id]
+        if user_id in user_last_active:
+            del user_last_active[user_id]
+        logger.info(f"Cleaned up expired session for user {user_id}")
 
-async def send_long_message(update, text, parse_mode=None):
-    MAX_MESSAGE_LENGTH = 4000
-    
+async def send_long_message(update: Update, text: str):
+    MAX_MESSAGE_LENGTH = 4096
     if len(text) <= MAX_MESSAGE_LENGTH:
         try:
-            await update.message.reply_text(text, parse_mode=parse_mode)
-            return
-        except Exception as e:
-            logger.warning(f"Failed to send message: {e}")
             await update.message.reply_text(text)
-            return
-    
-    lines = text.split('\n')
-    chunks = []
-    current_chunk = ""
-    
-    for line in lines:
-        if len(current_chunk) + len(line) + 1 > MAX_MESSAGE_LENGTH:
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-            current_chunk = line
+        except Exception as e:
+            logger.error(f"Failed to send message for user {update.message.from_user.id}: {e}")
+        return
+
+    parts = []
+    current_part = ""
+    for line in text.split('\n'):
+        if len(current_part) + len(line) + 1 > MAX_MESSAGE_LENGTH:
+            parts.append(current_part)
+            current_part = line
         else:
-            if current_chunk:
-                current_chunk += "\n" + line
-            else:
-                current_chunk = line
-    
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-    
-    for chunk in chunks:
-        if chunk:
+            current_part += '\n' + line
+    parts.append(current_part)
+
+    for part in parts:
+        if part.strip():
             try:
-                await update.message.reply_text(chunk, parse_mode=parse_mode)
+                await update.message.reply_text(part)
                 await asyncio.sleep(0.5)
             except Exception as e:
-                logger.warning(f"Failed to send chunk: {e}")
-                await update.message.reply_text(chunk)
-                await asyncio.sleep(0.5)
+                logger.error(f"Failed to send message part for user {update.message.from_user.id}: {e}")
 
 async def check_spam(update: Update, message_content: str) -> bool:
     user_id = update.message.from_user.id
@@ -118,38 +120,25 @@ async def check_spam(update: Update, message_content: str) -> bool:
     
     if activity['blocked_until'] > current_time:
         remaining_time = int(activity['blocked_until'] - current_time)
-        await update.message.reply_text(
-            f"Please wait {remaining_time} seconds before sending a new request. "
-            "This is part of spam protection."
-        )
-        logger.info(f"User {user_id} is still blocked for {remaining_time} seconds.")
+        await update.message.reply_text(f"Please wait {remaining_time} seconds before sending a new request.")
         return True
     
-    activity['timestamps'] = [t for t in activity['timestamps']
-                              if current_time - t < RATE_LIMIT_SECONDS]
+    activity['timestamps'] = [t for t in activity['timestamps'] if current_time - t < RATE_LIMIT_SECONDS]
     activity['timestamps'].append(current_time)
     
-    if (message_content and
-        message_content.lower() == activity['last_message'].lower() and
-        activity['last_message_count'] >= REPEAT_MESSAGE_THRESHOLD):
-        await update.message.reply_text(
-            "I have already received this message. Please send something new or wait a bit."
-        )
-        logger.info(f"User {user_id} sent identical message repeatedly.")
-        return True
-    
-    if message_content and message_content.lower() == activity['last_message'].lower():
+    if (message_content and message_content.lower() == activity['last_message'].lower()):
         activity['last_message_count'] += 1
     else:
         activity['last_message'] = message_content
         activity['last_message_count'] = 1
+        
+    if activity['last_message_count'] > REPEAT_MESSAGE_THRESHOLD:
+        await update.message.reply_text("I have already received this message. Please send something new.")
+        return True
     
     if len(activity['timestamps']) > RATE_LIMIT_MESSAGES:
         activity['blocked_until'] = current_time + COOLDOWN_SECONDS
-        await update.message.reply_text(
-            f"You are sending too many messages. "
-            f"Please wait {COOLDOWN_SECONDS} seconds."
-        )
+        await update.message.reply_text(f"You are sending too many messages. Please wait {COOLDOWN_SECONDS} seconds.")
         logger.warning(f"User {user_id} hit rate limit, blocked for {COOLDOWN_SECONDS} seconds.")
         return True
     
@@ -157,18 +146,16 @@ async def check_spam(update: Update, message_content: str) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"User {update.message.from_user.id} started the bot.")
-    await update.message.reply_text(
-        'Hi! I am a Gemini-based bot. Send me a message, photo, or voice message, and I will try to respond.'
-    )
+    await update.message.reply_text('Hi! I am a Gemini-based bot. Send me a message, photo, or voice message.')
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
     if user_id in user_chat_sessions:
         del user_chat_sessions[user_id]
-        logger.info(f"Chat history cleared for user {user_id}.")
-        await update.message.reply_text("Chat history cleared. We can start a new conversation now.")
-    else:
-        await update.message.reply_text("Your chat history is already empty.")
+    if user_id in user_last_active:
+        del user_last_active[user_id]
+    logger.info(f"Chat history cleared for user {user_id}.")
+    await update.message.reply_text("Chat history cleared. We can start a new conversation now.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
@@ -177,6 +164,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     if await check_spam(update, user_message):
         return
+        
+    await cleanup_old_sessions()
     
     await update.message.chat.send_action(ChatAction.TYPING)
     
@@ -184,82 +173,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_chat_sessions[user_id] = text_model.start_chat(history=INITIAL_HTML_INSTRUCTION)
         logger.info(f"Started new text chat session for user {user_id}.")
     
+    user_last_active[user_id] = datetime.now()
+
     try:
-        response = await user_chat_sessions[user_id].send_message_async(
-            user_message,
-            safety_settings=safety_settings
-        )
-        
-        final_text = clean_text_formatting(response.text)
-        
+        response = await user_chat_sessions[user_id].send_message_async(user_message, safety_settings=safety_settings)
+        final_text = clean_text_for_telegram(response.text)
         await send_long_message(update, final_text)
-        
     except BlockedPromptException as e:
         logger.warning(f"Blocked content detected for user {user_id}: {e}")
-        await update.message.reply_text(
-            "Sorry, your request or response contains content that was blocked due to safety settings."
-        )
+        await update.message.reply_text("Sorry, your request contains content that was blocked due to safety settings.")
     except Exception as e:
         logger.error(f"Error processing text message from {user_id}: {e}", exc_info=True)
-        await update.message.reply_text(f"An error occurred while processing your text request: {e}")
+        await update.message.reply_text(f"An error occurred while processing your request: {e}")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
-    caption_prompt = update.message.caption if update.message.caption else ""
+    caption_prompt = update.message.caption or ""
     logger.info(f"User {user_id} sent photo with caption: {caption_prompt}")
     
     spam_check_content = caption_prompt if caption_prompt else f"photo__{update.message.photo[-1].file_id}"
     if await check_spam(update, spam_check_content):
         return
+        
+    await cleanup_old_sessions()
     
-    await update.message.reply_text("Received, processing...")
+    await update.message.reply_text("Received image, processing...")
     await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
     
     file_id = update.message.photo[-1].file_id
     file = await context.bot.get_file(file_id)
-    photo_dir = "downloads"
-    os.makedirs(photo_dir, exist_ok=True)
-    photo_path = os.path.join(photo_dir, f"{file_id}.jpg")
     
     uploaded_file = None
     
     try:
-        await file.download_to_drive(photo_path)
-        logger.info(f"Photo downloaded to {photo_path}")
-        
-        uploaded_file = genai.upload_file(path=photo_path)
-        logger.info(f"Photo uploaded to Gemini: {uploaded_file.name}")
-        
+        with BytesIO() as bio:
+            await file.download_to_memory(bio)
+            bio.seek(0)
+            image = Image.open(bio)
+            
+            img_byte_arr = BytesIO()
+            image.save(img_byte_arr, format='JPEG')
+            img_byte_arr.seek(0)
+
+            uploaded_file = genai.upload_file(path=img_byte_arr, display_name=f"{file_id}.jpg", mime_type="image/jpeg")
+            logger.info(f"Photo uploaded to Gemini: {uploaded_file.name}")
+
         if user_id not in user_chat_sessions or user_chat_sessions[user_id].model != vision_audio_model:
             user_chat_sessions[user_id] = vision_audio_model.start_chat(history=INITIAL_HTML_INSTRUCTION)
             logger.info(f"Started new vision/audio chat session for user {user_id}.")
+            
+        user_last_active[user_id] = datetime.now()
         
         request_content = [uploaded_file, caption_prompt] if caption_prompt else [uploaded_file]
-        
-        response = await user_chat_sessions[user_id].send_message_async(
-            request_content,
-            safety_settings=safety_settings
-        )
-        
-        final_text = clean_text_formatting(response.text)
-        
+        response = await user_chat_sessions[user_id].send_message_async(request_content, safety_settings=safety_settings)
+        final_text = clean_text_for_telegram(response.text)
         await send_long_message(update, final_text)
         
     except BlockedPromptException as e:
         logger.warning(f"Blocked content detected for user {user_id}: {e}")
-        await update.message.reply_text(
-            "Sorry, your request or response contains content that was blocked due to safety settings."
-        )
+        await update.message.reply_text("Sorry, your request contains content that was blocked due to safety settings.")
     except Exception as e:
         logger.error(f"Error processing photo from {user_id}: {e}", exc_info=True)
         await update.message.reply_text(f"An error occurred while processing your photo: {e}")
     finally:
-        if os.path.exists(photo_path):
-            os.remove(photo_path)
-            logger.info(f"Local photo file {photo_path} removed.")
         if uploaded_file and hasattr(uploaded_file, 'name'):
             try:
                 await genai.delete_file_async(uploaded_file.name)
+                logger.info(f"Deleted Gemini file {uploaded_file.name}")
             except Exception as e:
                 logger.error(f"Error deleting Gemini file {uploaded_file.name}: {e}")
 
@@ -270,76 +250,62 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     spam_check_content = f"voice__{update.message.voice.file_id}"
     if await check_spam(update, spam_check_content):
         return
-    
-    await update.message.reply_text("Uploading voice message, please wait...")
+
+    await cleanup_old_sessions()
+
+    await update.message.reply_text("Received voice message, processing...")
     await update.message.chat.send_action(ChatAction.UPLOAD_VOICE)
     
     file_id = update.message.voice.file_id
     file = await context.bot.get_file(file_id)
-    voice_dir = "downloads"
-    os.makedirs(voice_dir, exist_ok=True)
-    voice_path = os.path.join(voice_dir, f"{file_id}.ogg")
     
     uploaded_file = None
     
     try:
-        await file.download_to_drive(voice_path)
-        logger.info(f"Voice message downloaded to {voice_path}")
-        
-        uploaded_file = genai.upload_file(path=voice_path, mime_type="audio/ogg")
-        logger.info(f"Voice message uploaded to Gemini: {uploaded_file.name}")
-        
+        with BytesIO() as bio:
+            await file.download_to_memory(bio)
+            bio.seek(0)
+            uploaded_file = genai.upload_file(path=bio, display_name=f"{file_id}.ogg", mime_type="audio/ogg")
+            logger.info(f"Voice message uploaded to Gemini: {uploaded_file.name}")
+
         if user_id not in user_chat_sessions or user_chat_sessions[user_id].model != vision_audio_model:
             user_chat_sessions[user_id] = vision_audio_model.start_chat(history=INITIAL_HTML_INSTRUCTION)
             logger.info(f"Started new vision/audio chat session for user {user_id}.")
+            
+        user_last_active[user_id] = datetime.now()
         
         prompt_for_gemini = "Transcribe the following voice message, and then respond to its content."
-        
-        response = await user_chat_sessions[user_id].send_message_async(
-            [uploaded_file, prompt_for_gemini],
-            safety_settings=safety_settings
-        )
-        
-        final_text = clean_text_formatting(response.text)
-        
+        response = await user_chat_sessions[user_id].send_message_async([uploaded_file, prompt_for_gemini], safety_settings=safety_settings)
+        final_text = clean_text_for_telegram(response.text)
         await send_long_message(update, final_text)
         
     except BlockedPromptException as e:
         logger.warning(f"Blocked content detected for user {user_id}: {e}")
-        await update.message.reply_text(
-            "Sorry, your request or response contains content that was blocked due to safety settings."
-        )
+        await update.message.reply_text("Sorry, your request contains content that was blocked due to safety settings.")
     except Exception as e:
         logger.error(f"Error processing voice message from {user_id}: {e}", exc_info=True)
         await update.message.reply_text(f"An error occurred while processing your voice message: {e}")
     finally:
-        if os.path.exists(voice_path):
-            os.remove(voice_path)
-            logger.info(f"Local voice file {voice_path} removed.")
         if uploaded_file and hasattr(uploaded_file, 'name'):
             try:
                 await genai.delete_file_async(uploaded_file.name)
+                logger.info(f"Deleted Gemini file {uploaded_file.name}")
             except Exception as e:
                 logger.error(f"Error deleting Gemini file {uploaded_file.name}: {e}")
 
 async def unhandled_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.message.from_user.id
-    content_type = (update.message.effective_attachment.content_type
-                    if update.message.effective_attachment else "unknown")
-    logger.info(f"User {user_id} sent unhandled message type: {content_type}")
-    
-    spam_check_content = f"unhandled__{content_type}"
-    if await check_spam(update, spam_check_content):
-        return
-    
-    reply_text = (
-        f"Sorry, I cannot process messages of type '{content_type}' yet.\n\n"
-        "Please send me a text message, photo, or voice message."
-    )
-    await update.message.reply_text(reply_text)
+    logger.info(f"User {update.message.from_user.id} sent an unhandled message type.")
+    await update.message.reply_text("Sorry, I can only process text messages, photos, and voice messages.")
 
 def main() -> None:
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
@@ -349,15 +315,12 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.VOICE, handle_voice))
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, unhandled_message))
     
-    logger.info("Bot started. Send /start, /clear, any message, photo or voice message in Telegram.")
+    logger.info("Bot started successfully.")
     
     try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
-        logger.error(f"Bot stopped with error: {e}")
+        logger.critical(f"Bot stopped with a critical error: {e}", exc_info=True)
     finally:
         logger.info("Bot stopped.")
 
