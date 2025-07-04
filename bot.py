@@ -16,6 +16,8 @@ from dotenv import load_dotenv
 from telegram.constants import ParseMode, ChatAction
 import httpx
 from datetime import datetime, timedelta
+import threading
+import sys
 
 load_dotenv()
 
@@ -297,6 +299,14 @@ async def unhandled_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     logger.info(f"User {update.message.from_user.id} sent an unhandled message type.")
     await update.message.reply_text("Sorry, I can only process text messages, photos, and voice messages.")
 
+def restart_bot():
+    logger.info("Restarting bot...")
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+
+def schedule_restart():
+    threading.Timer(3600, restart_bot).start()
+
 def main() -> None:
     application = (
         Application.builder()
@@ -304,6 +314,8 @@ def main() -> None:
         .connect_timeout(30)
         .read_timeout(30)
         .write_timeout(30)
+        .pool_timeout(60)
+        .connection_pool_size(128)
         .build()
     )
     
@@ -317,6 +329,9 @@ def main() -> None:
     
     logger.info("Bot started successfully.")
     
+    # Schedule the first restart
+    schedule_restart()
+
     try:
         application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
