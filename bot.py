@@ -29,8 +29,8 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 INITIAL_HTML_INSTRUCTION = []
 
-text_model = genai.GenerativeModel('gemini-1.5-flash')
-vision_audio_model = genai.GenerativeModel('gemini-1.5-flash')
+text_model = genai.GenerativeModel('gemini-2.5-flash')
+vision_audio_model = genai.GenerativeModel('gemini-2.5-flash')
 
 safety_settings = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
