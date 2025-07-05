@@ -11,23 +11,35 @@ from io import BytesIO
 import base64
 import logging
 import time
-import html
 from dotenv import load_dotenv
-from telegram.constants import ParseMode, ChatAction
-import httpx
+from telegram.constants import ChatAction
 from datetime import datetime, timedelta
 import threading
 import sys
+import json
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID")
 
-if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
-    raise ValueError("TELEGRAM_BOT_TOKEN and GEMINI_API_KEY environment variables must be set. Please check your .env file.")
+if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY or not ADMIN_USER_ID:
+    raise ValueError("TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, and ADMIN_USER_ID environment variables must be set. Please check your .env file.")
+
+ADMIN_USER_ID = int(ADMIN_USER_ID)
 
 genai.configure(api_key=GEMINI_API_KEY)
+
+CHAT_HISTORY_DIR = 'chat_histories'
+FULL_CHAT_HISTORY_DIR = 'full_chat_histories'
+FULL_HISTORY_USERS_FILE = 'full_history_users.json'
+
+os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
+os.makedirs(FULL_CHAT_HISTORY_DIR, exist_ok=True)
+
+MAX_MESSAGES_TO_REMEMBER = 10
+MAX_FULL_HISTORY_MESSAGES_TO_REMEMBER = 200
 
 INITIAL_HTML_INSTRUCTION = []
 
@@ -54,6 +66,64 @@ user_activity = {}
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def get_history_file_path(user_id: int) -> str:
+    return os.path.join(CHAT_HISTORY_DIR, f'{user_id}_history.json')
+
+def get_full_history_file_path(user_id: int) -> str:
+    return os.path.join(FULL_CHAT_HISTORY_DIR, f'{user_id}_full_history.json')
+
+def load_full_history_users() -> set:
+    if os.path.exists(FULL_HISTORY_USERS_FILE):
+        try:
+            with open(FULL_HISTORY_USERS_FILE, 'r', encoding='utf-8') as f:
+                return set(json.load(f))
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding full_history_users.json: {e}. Starting with empty set.")
+            return set()
+    return set()
+
+def save_full_history_users(users: set):
+    with open(FULL_HISTORY_USERS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(list(users), f, ensure_ascii=False, indent=2)
+
+FULL_HISTORY_ENABLED_USERS = load_full_history_users()
+
+def load_chat_history(user_id: int) -> list:
+    file_path = get_history_file_path(user_id)
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON for user {user_id}: {e}. Starting new history.")
+            return []
+    return []
+
+def save_chat_history(user_id: int, history: list):
+    file_path = get_history_file_path(user_id)
+    if len(history) > MAX_MESSAGES_TO_REMEMBER * 2:
+        history = history[-MAX_MESSAGES_TO_REMEMBER * 2:]
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+def load_full_chat_history(user_id: int) -> list:
+    file_path = get_full_history_file_path(user_id)
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding full history JSON for user {user_id}: {e}. Starting new full history.")
+            return []
+    return []
+
+def save_full_chat_history(user_id: int, history: list):
+    file_path = get_full_history_file_path(user_id)
+    if len(history) > MAX_FULL_HISTORY_MESSAGES_TO_REMEMBER:
+        history = history[-MAX_FULL_HISTORY_MESSAGES_TO_REMEMBER:]
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
 def clean_text_for_telegram(text: str) -> str:
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
     text = re.sub(r'\*(.*?)\*', r'\1', text)
@@ -77,7 +147,7 @@ async def cleanup_old_sessions():
             del user_chat_sessions[user_id]
         if user_id in user_last_active:
             del user_last_active[user_id]
-        logger.info(f"Cleaned up expired session for user {user_id}")
+        logger.info(f"Cleaned up in-memory session for user {user_id}")
 
 async def send_long_message(update: Update, text: str):
     MAX_MESSAGE_LENGTH = 4096
@@ -90,13 +160,19 @@ async def send_long_message(update: Update, text: str):
 
     parts = []
     current_part = ""
-    for line in text.split('\n'):
+    lines = text.split('\n')
+    for line in lines:
         if len(current_part) + len(line) + 1 > MAX_MESSAGE_LENGTH:
-            parts.append(current_part)
+            if current_part:
+                parts.append(current_part)
             current_part = line
+            while len(current_part) > MAX_MESSAGE_LENGTH:
+                parts.append(current_part[:MAX_MESSAGE_LENGTH])
+                current_part = current_part[MAX_MESSAGE_LENGTH:]
         else:
-            current_part += '\n' + line
-    parts.append(current_part)
+            current_part += ('\n' if current_part else '') + line
+    if current_part:
+        parts.append(current_part)
 
     for part in parts:
         if part.strip():
@@ -156,8 +232,53 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         del user_chat_sessions[user_id]
     if user_id in user_last_active:
         del user_last_active[user_id]
-    logger.info(f"Chat history cleared for user {user_id}.")
-    await update.message.reply_text("Chat history cleared. We can start a new conversation now.")
+
+    std_file_path = get_history_file_path(user_id)
+    if os.path.exists(std_file_path):
+        os.remove(std_file_path)
+        logger.info(f"Deleted standard chat history file for user {user_id}.")
+    
+    full_file_path = get_full_history_file_path(user_id)
+    if os.path.exists(full_file_path):
+        os.remove(full_file_path)
+        logger.info(f"Deleted full chat history file for user {user_id}.")
+    
+    logger.info(f"All chat history cleared for user {user_id}.")
+    await update.message.reply_text("All chat history cleared for you. We can start a new conversation now.")
+
+async def history_control(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global FULL_HISTORY_ENABLED_USERS
+    
+    if update.message.from_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("You are not authorized to use this command.")
+        logger.warning(f"Unauthorized access to /history command by user {update.message.from_user.id}")
+        return
+
+    args = context.args
+    if len(args) != 2 or args[0].lower() not in ["on", "off"]:
+        await update.message.reply_text("Usage: /history <on|off> <user_id>")
+        return
+
+    action = args[0].lower()
+    try:
+        target_user_id = int(args[1])
+    except ValueError:
+        await update.message.reply_text("Invalid user ID. Please provide a numeric ID.")
+        return
+
+    if action == "on":
+        FULL_HISTORY_ENABLED_USERS.add(target_user_id)
+        save_full_history_users(FULL_HISTORY_ENABLED_USERS)
+        await update.message.reply_text(f"Full history logging ENABLED for user {target_user_id}.")
+        logger.info(f"Admin {ADMIN_USER_ID} enabled full history for user {target_user_id}")
+    elif action == "off":
+        if target_user_id in FULL_HISTORY_ENABLED_USERS:
+            FULL_HISTORY_ENABLED_USERS.remove(target_user_id)
+            save_full_history_users(FULL_HISTORY_ENABLED_USERS)
+            await update.message.reply_text(f"Full history logging DISABLED for user {target_user_id}.")
+            logger.info(f"Admin {ADMIN_USER_ID} disabled full history for user {target_user_id}")
+        else:
+            await update.message.reply_text(f"Full history logging was not enabled for user {target_user_id}.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.message.from_user.id
@@ -171,15 +292,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     await update.message.chat.send_action(ChatAction.TYPING)
     
-    if user_id not in user_chat_sessions or user_chat_sessions[user_id].model != text_model:
-        user_chat_sessions[user_id] = text_model.start_chat(history=INITIAL_HTML_INSTRUCTION)
-        logger.info(f"Started new text chat session for user {user_id}.")
-    
-    user_last_active[user_id] = datetime.now()
+    current_history = []
+    if user_id in FULL_HISTORY_ENABLED_USERS:
+        current_history = load_full_chat_history(user_id)
+        logger.info(f"Loaded FULL chat history for user {user_id} ({len(current_history)} messages).")
+    else:
+        current_history = load_chat_history(user_id)
+        logger.info(f"Loaded standard chat history for user {user_id} ({len(current_history)} messages).")
+
+    gemini_history = INITIAL_HTML_INSTRUCTION + current_history
 
     try:
-        response = await user_chat_sessions[user_id].send_message_async(user_message, safety_settings=safety_settings)
+        chat_session = text_model.start_chat(history=gemini_history)
+
+        response = await chat_session.send_message_async(user_message, safety_settings=safety_settings)
         final_text = clean_text_for_telegram(response.text)
+        
+        current_history.append({"role": "user", "parts": [user_message]})
+        current_history.append({"role": "model", "parts": [response.text]})
+        
+        if user_id in FULL_HISTORY_ENABLED_USERS:
+            save_full_chat_history(user_id, current_history)
+        else:
+            save_chat_history(user_id, current_history)
+        
+        user_last_active[user_id] = datetime.now()
+        
         await send_long_message(update, final_text)
     except BlockedPromptException as e:
         logger.warning(f"Blocked content detected for user {user_id}: {e}")
@@ -207,6 +345,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     
     uploaded_file = None
     
+    current_history = []
+    if user_id in FULL_HISTORY_ENABLED_USERS:
+        current_history = load_full_chat_history(user_id)
+        logger.info(f"Loaded FULL chat history for user {user_id} (vision/audio).")
+    else:
+        current_history = load_chat_history(user_id)
+        logger.info(f"Loaded standard chat history for user {user_id} (vision/audio).")
+
+    gemini_history = INITIAL_HTML_INSTRUCTION + current_history
+
     try:
         with BytesIO() as bio:
             await file.download_to_memory(bio)
@@ -220,15 +368,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             uploaded_file = genai.upload_file(path=img_byte_arr, display_name=f"{file_id}.jpg", mime_type="image/jpeg")
             logger.info(f"Photo uploaded to Gemini: {uploaded_file.name}")
 
-        if user_id not in user_chat_sessions or user_chat_sessions[user_id].model != vision_audio_model:
-            user_chat_sessions[user_id] = vision_audio_model.start_chat(history=INITIAL_HTML_INSTRUCTION)
-            logger.info(f"Started new vision/audio chat session for user {user_id}.")
+        chat_session = vision_audio_model.start_chat(history=gemini_history)
             
         user_last_active[user_id] = datetime.now()
         
         request_content = [uploaded_file, caption_prompt] if caption_prompt else [uploaded_file]
-        response = await user_chat_sessions[user_id].send_message_async(request_content, safety_settings=safety_settings)
+        response = await chat_session.send_message_async(request_content, safety_settings=safety_settings)
         final_text = clean_text_for_telegram(response.text)
+        
+        current_history.append({"role": "user", "parts": [caption_prompt if caption_prompt else "User sent an image."]})
+        current_history.append({"role": "model", "parts": [response.text]})
+        
+        if user_id in FULL_HISTORY_ENABLED_USERS:
+            save_full_chat_history(user_id, current_history)
+        else:
+            save_chat_history(user_id, current_history)
+
         await send_long_message(update, final_text)
         
     except BlockedPromptException as e:
@@ -262,6 +417,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     file = await context.bot.get_file(file_id)
     
     uploaded_file = None
+
+    current_history = []
+    if user_id in FULL_HISTORY_ENABLED_USERS:
+        current_history = load_full_chat_history(user_id)
+        logger.info(f"Loaded FULL chat history for user {user_id} (voice).")
+    else:
+        current_history = load_chat_history(user_id)
+        logger.info(f"Loaded standard chat history for user {user_id} (voice).")
+    
+    gemini_history = INITIAL_HTML_INSTRUCTION + current_history
     
     try:
         with BytesIO() as bio:
@@ -270,15 +435,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             uploaded_file = genai.upload_file(path=bio, display_name=f"{file_id}.ogg", mime_type="audio/ogg")
             logger.info(f"Voice message uploaded to Gemini: {uploaded_file.name}")
 
-        if user_id not in user_chat_sessions or user_chat_sessions[user_id].model != vision_audio_model:
-            user_chat_sessions[user_id] = vision_audio_model.start_chat(history=INITIAL_HTML_INSTRUCTION)
-            logger.info(f"Started new vision/audio chat session for user {user_id}.")
+        chat_session = vision_audio_model.start_chat(history=gemini_history)
             
         user_last_active[user_id] = datetime.now()
         
         prompt_for_gemini = "Transcribe the following voice message, and then respond to its content."
-        response = await user_chat_sessions[user_id].send_message_async([uploaded_file, prompt_for_gemini], safety_settings=safety_settings)
+        response = await chat_session.send_message_async([uploaded_file, prompt_for_gemini], safety_settings=safety_settings)
         final_text = clean_text_for_telegram(response.text)
+
+        current_history.append({"role": "user", "parts": [f"User sent a voice message. Context prompt: {prompt_for_gemini}"]})
+        current_history.append({"role": "model", "parts": [response.text]})
+        
+        if user_id in FULL_HISTORY_ENABLED_USERS:
+            save_full_chat_history(user_id, current_history)
+        else:
+            save_chat_history(user_id, current_history)
+
         await send_long_message(update, final_text)
         
     except BlockedPromptException as e:
@@ -321,6 +493,7 @@ def main() -> None:
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("clear", clear_history))
+    application.add_handler(CommandHandler("history", history_control))
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -329,7 +502,6 @@ def main() -> None:
     
     logger.info("Bot started successfully.")
     
-    # Schedule the first restart
     schedule_restart()
 
     try:
